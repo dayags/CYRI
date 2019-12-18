@@ -1,0 +1,662 @@
+
+PART 1. HERE WE WILL READ AND FORMAT OUR DATA IN R.
+```{r}
+#The packges below, as well as other packages downstream need to be installed. Packages in the subsequent chunks cannot be moved, or imported, before executing upstream code chunks due to masking/conflict of package commands. 
+library(igraph)
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(yarrr)
+library(reshape2)
+library(ggpubr)
+
+#List  files and assign to an R object for subsequent reading:
+PPIdata_files=list.files(pattern = ".csv")
+PPIdata_files = PPIdata_files[!str_detect(PPIdata_files, "Phosphorylation_PTM")]
+
+#Read all files into a list:
+PPIdata=lapply(PPIdata_files, read.csv, sep=",", header=T)
+
+#A helper function to extract relavant file names:
+name_func<-function(filesname) {
+  name<-strsplit(filesname, "_")[[1]][1]
+  return(name)
+}
+
+#Assign names to each network:
+names(PPIdata)<-unlist(lapply(PPIdata_files, name_func))
+#---------------------------------------------------
+#This part is only needed if the input data is not already filtered
+
+# #A helper function to filter high confidence interactions(not shown here: the score threshold is picked based on best MCC when compared to literature):
+# filter_func<-function(datalist){
+# 
+#   filtered_data<-as_tibble(datalist)%>%filter(Score>2)
+#   return(filtered_data)
+# }
+#
+# #Apply filter function to all data files:
+# filtered_PPIdata<-lapply(PPIdata, filter_func)
+#---------------------------------------------------
+```
+
+PART 2. HERE WE WILL GENERATE A NETWORK FOR EACH CONDITION AND DO SOME PRELIMINARY DATA VISUALIZATION.
+
+```{r}
+#A helper function to make graphs out of edgelist data files; 
+makegraph<-function(filtered_data) {
+  network_data<-graph_from_data_frame(filtered_data, directed = F) 
+  return(network_data)
+}
+
+networks_list<-lapply(PPIdata, makegraph)
+
+#A helper function to plot with degree and interaction score information: 
+plot_with_degree<-function(network){
+  
+  
+  deg<-igraph::degree(network)
+  V(network)$name[deg < 7] <- ''
+  E(network)$width <- 0.5*log(E(network)$Score, 2)
+  
+
+  plot(network,
+                    vertex.label.cex = 0.3, 
+                    vertex.size=deg,
+                    margin=c(0,0,0,0)
+  )
+  
+  
+}
+#Apply the helper plotting function to all networks:
+lapply(networks_list, plot_with_degree)
+
+#Make pdf files for each plot and name files by condition:
+lapply(1:length(networks_list), function(i){
+    
+    filename <- sprintf('%s.pdf',names(networks_list)[i])  
+  
+    network <- networks_list[[i]]
+    #Open file:
+    pdf(filename,width=8,height=8)
+    #margins:
+    par(mar = c(10,10,10,10))
+    #Outside margins:
+    par(oma = c(0,0,0,0))
+    #Xpd - when TRUE you can draw outside of plotting area into the margins:
+    par(xpd = T)
+    plot_with_degree(network)
+    #close file:
+    dev.off()
+  })
+```
+PART 3.HERE WE WILL MERGE MULTIPLE NETWORKS FOR MORE SOPHISTICATED ANALYSIS.
+```{r}
+library(data.table)
+
+#Add extra column to each PPI dataframe to indicate conditions and merge:
+rbound_data = lapply(names(PPIdata), function(name) {
+  PPIdata[[name]]$condition = name
+  return(PPIdata[[name]])
+}) %>% rbindlist()
+
+#Make an igraph object:
+net <- igraph::graph_from_data_frame(rbound_data, directed=F) 
+
+
+#Plot the network where node size reflects degree information:
+#Extract degree information:
+deg<-igraph::degree(net)
+
+#Fix the layout of the network:
+fixed_layout <- layout_with_fr(net)
+
+#Assign colors to conditions:
+cond_colours = c("Baseline" = "royalblue1","PoorCarbon" = "khaki2", "Cold25C" = "turquoise1", "HU" = "red", "MMS" = "orange",  "H2O2" = "hotpink", "Rapamycin" = "springgreen")
+
+#Plot a merged network with a fixed layout of vertices and sequentialling adding the edges of conditions:
+outputPDFPath = paste0(getwd(), "/conditionalPPI.pdf")
+pdf(file=outputPDFPath)
+par(xpd=TRUE)
+layout(matrix(c(1, 5, 2, 6, 3, 7, 4, 8), nrow = 2, ncol = 4),  heights = c(100, 100),
+       widths = c(150, 150, 150, 150))
+cond_colours_inuse = c()
+for (index in 1:length(cond_colours)) {
+  cond_colours_inuse = c(cond_colours_inuse, cond_colours[index])
+  par(mar = c(0, 0, 0, 0))
+  par(xpd=TRUE)
+  plot(net, edge.color=cond_colours_inuse[E(net)$condition], vertex.color="gray40", edge.curved=.3, vertex.label=NA, vertex.size=log(deg,2), layout=fixed_layout)
+}
+
+plot.new()
+legend("bottom",inset = 0.2, legend=c("Baseline","PoorCarbon", "Cold25C", "HU", "MMS","H2O2", "Rapamycin"),text.width = 0.8,col=c("royalblue1","khaki2","turquoise1","red","orange","hotpink","springgreen"), lwd=5, cex=1.2, horiz = F)
+par(xpd=FALSE)
+
+dev.off() 
+
+#Plot distribution of scores across coniditions:
+pirateplot(formula = Score ~ condition, 
+                   data = rbound_data,
+                   main = "Conditional PPI score distribution",
+                   xlab = "Condition",
+                   ylab = "Interaction Score")
+#PPI score distributions vary across conditions, with most drammatic changes observed in Poor Carbon condition.
+```
+
+
+```{r}
+#We will quantify the similarity between PPI profiles of different conditions by calculating Pearson Correlation coefficients and visualizing them in a correlation matrix: 
+
+#Join multiple networks as columns:
+cbound_data=PPIdata[[1]]
+names(cbound_data)[3]<-names(PPIdata)[1]
+
+for (i in 2:length(PPIdata)){ 
+
+  temp_dataframe<-PPIdata[[i]]
+ 
+  cbound_data<-merge(cbound_data, temp_dataframe, by = c("AD", "DB"), all.x=T, all.y=T)
+names(cbound_data)[2+i]<-names(PPIdata)[i]
+}
+
+#Set all NA values to  an arbitrarily small number:
+cbound_data[is.na(cbound_data)] <- 0.1
+
+#Calculate the correlation matrix:
+cormat <- round(cor(cbound_data[,3:9]),2)
+melted_cormat <- reshape2::melt(cormat)
+ get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+  }
+upper_tri <- get_upper_tri(cormat)
+melted_cormat <- reshape2::melt(upper_tri, na.rm = TRUE)
+
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(0,1), space = "Lab", 
+   name="Pearson\nCorrelation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+#PPI profiles of different conditions have a mediocre agreement, which is expected given that changing conditions induce different cellular responses.
+
+#Another way of assesing the similarity amongst conditional PPI profiles is to perform a principal component analysis (PCA). We will visualize PPI profiles across all conditions in a two-component PCA plot:
+
+#Perform PCA and convert data into PCA object:
+Diff_PPI.pca <- prcomp(cbound_data[,3:9], center = TRUE,scale. = TRUE)
+
+#We will view the summary of PCA:
+summary(Diff_PPI.pca)
+
+library(devtools)
+library(ggbiplot)
+
+#Visualize PPI profile vectors on the PCA plot:
+ggbiplot(Diff_PPI.pca, ellipse=T)+scale_color_manual(name="AD", values="orange")
+
+#To make the visualization simpler and more interpretable we will plot rotations:
+ggplot(as.data.frame(Diff_PPI.pca$rotation), aes(x=PC1, y=PC2)) + geom_point()+ geom_text(label=rownames(as.data.frame(Diff_PPI.pca$rotation)), vjust=1.2, hjust=-0.1) + theme_classic() +
+theme(plot.margin = unit(c(1,1,1,1), "cm"))
+
+#As seen from the plot, MMS, H2O2 and PoorCarbon conditions have the most different PPI profiles compared to the Baseline condition. 
+```
+PART 4.HERE WE WILL PERFORM EXPLORATORY DEGREE ANALYSIS.
+
+```{r}
+#Make a table of degree information for each gene in each condition: 
+degTables = lapply(names(PPIdata), function(name) {
+  net_temp <- graph_from_data_frame(PPIdata[[name]], directed=F)
+  deg_temp<-igraph::degree(net_temp)
+  degTable = data.table(gene = names(deg_temp), deg_temp)
+  names(degTable)[2] = name
+  return(degTable)
+})
+
+names(degTables)<-names(PPIdata)
+
+#Merge degree information for each condition:
+merged_deg = degTables[[1]]
+for (i in 2:length(degTables)) {
+  merged_deg = merge(merged_deg, degTables[[i]], all = T)
+}
+
+#Assign NA values to 0:
+merged_deg[is.na(merged_deg)] <- 0
+class(merged_deg)
+
+
+#Bind degree information with condition information:
+rbound_deg = lapply(names(degTables), function(name) {
+  names(degTables[[name]])[2] <- "degree"
+  degTables[[name]]$condition = name
+  return(degTables[[name]])
+}) %>% rbindlist()
+
+#Plot degree distribution for each condition with matching colors:
+ggplot(rbound_deg, aes(x=log2(degree), fill = condition)) +
+  geom_density(show.legend = T, alpha = 0.4) +
+  theme_minimal() +
+  scale_fill_manual(values = c("Baseline" = "royalblue1","PoorCarbon" = "khaki2", "Cold25C" = "turquoise1", "HU" = "red", "MMS" = "orange",  "H2O2" = "hotpink", "Rapamycin" = "springgreen"))
+
+#It looks like degree distributions across conditions are similar. PoorCarbon condition is slightly more enriched for higher degree nodes. 
+```
+
+```{r}
+#Calculate degree changes over baseline and make into dataframe as columns:
+ cbound_deg_diff<-c()
+  for (i in 3:ncol(merged_deg)){
+    temp_cbound_deg <- abs(merged_deg$Baseline - merged_deg[,..i])
+    colnames(temp_cbound_deg) <- colnames(merged_deg[,..i])
+    cbound_deg_diff<-cbind(cbound_deg_diff, temp_cbound_deg)
+  }
+#Cbind with gene names:
+  cbound_deg_diff<-cbind("gene"=merged_deg$gene, cbound_deg_diff)
+  
+#We are interested to see which conditions cause in most number of degree changes. To visualize this we will first define 'Contextual hubs' as those proteins which change at least 3 edges in various conditions compared to the Baseline condition. Then we will plot degree changes of contextual hubs in each conditions: 
+  #Reshape data frame into "tall" structure:
+  cbound_deg_diff_melt <- reshape2::melt(cbound_deg_diff, id.vars="gene")
+  
+# Plot degree changes for contextual hubs (Absolute degree change(value)>3) in each condition:
+ggplot(cbound_deg_diff_melt[cbound_deg_diff_melt$value>3], aes(gene,value, col=variable)) + 
+  geom_point(alpha = 0.8) + 
+  stat_smooth() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  labs(y= "Absolute degree change")
+#From this plot it looks like the most degree changes for contextual hubs occur in PoorCarbon condition.
+```
+
+PART 5.HERE WE WILL COMBINE OUR DATA WITH OTHER AVAILABLE DATASETS FROM LITERATURE AND PERFORM VARIOUS EXPLORATORY ANALYSES:
+```{r}
+#Gene essentiality information is obtained from the Phenotype_data.tab file provided during the MMG1012 Programming for biologists course - Winter, 2019. 
+#Read phenotype data file into R:
+phenotype_data<-read.delim("phenotype_data.tab", sep = "\t", header = F, fill = T, comment.char = "", quote = "", as.is = T)
+
+#Extract unique essential genes:
+essential_genes=unique(phenotype_data$V1[grep("inviable", phenotype_data[,10])])
+
+#Annotate protein pairs containing essential and non-essential genes in a data frame:
+Phenotype=c()
+for(i in (1:nrow(rbound_data))){
+    if(rbound_data$AD[i] %in% essential_genes | rbound_data$DB[i] %in% essential_genes){
+        temp_pheno<-"Essential"
+    } else temp_pheno<-"Non-essential"
+    Phenotype=c(Phenotype, temp_pheno)  
+}
+
+rbound_with_pheno <- cbind(rbound_data, "phenotype" = Phenotype)
+pirateplot(formula = Score ~ condition + phenotype, 
+                   data = rbound_with_pheno,
+                   main = "Conditional PPI score distribution",
+                   xlab = "Condition",
+                   ylab = "Interaction Score")
+
+#Plot PPI score distributions across conditions and phenotypes:
+par(mar = c(15, 5, 2, 5), oma=c(0,0,0,0))
+plot(type = "n", x = 1)
+pirateplot(formula = Score ~ phenotype + condition, 
+                   data = rbound_with_pheno,
+                   main = "PPI score distribution across conditions and phenotypes",
+                   xlab = "",
+                   ylab = "PPI score",
+                   sortx = "sequential",xaxt = "n")
+vec1=seq(0,20, by=3)
+text(cex=0.8, x=c(rbind(vec1,vec1+1)), y=-1, unique(rbound_with_pheno$phenotype), xpd=TRUE, srt=45)
+
+text(cex=0.8, x=seq(1,21, by=3), y=-5, unique(rbound_with_pheno$condition), xpd=TRUE)
+
+#From the above plot it looks like only PoorCarbon condition may have significant difference between essential and non-essential genes in terms of PPI score distribution. To quantify the significance of this relationship we will perform two-sample Wilcoxon test just for PoorCarbon condition and visualize it: 
+
+#Perform Wilcoxon test using ggpubr package:
+my_comparisons=ggpubr::compare_means(Score ~ phenotype,  data = rbound_with_pheno[rbound_with_pheno$condition=="PoorCarbon"])
+
+#Indicate the categories for comparison:
+my_comparisons <- list( c("Essential", "Non-essential"))
+
+#Plot the PPI score distributions for essential and non-essential genes in PoorCarbon condition: 
+ggboxplot(rbound_with_pheno[rbound_with_pheno$condition=="PoorCarbon"], x = "phenotype", y = "Score",
+          color = "phenotype", palette = "jco")+ 
+  stat_compare_means(comparisons = my_comparisons)+ # Add pairwise comparisons p-value
+  stat_compare_means(label.y = 20)+     # Add global p-value
+  labs(title="Poor Carbon condition")
+#Based on the above test and plot the difference between essential and non-essential gene PPI score distributions passes the 0.05 significance threshold.
+
+```
+PART 6. HERE WE WILL FURTHER EXPLORE DIFFERENTIAL INTERACTIONS BY VISUALIZING GAIN AND LOSS OF PPI SCORES COMPARED TO THE BASELINE CONDITION.
+```{r}
+#Extract differential interactions compared to the Baseline condition and rbind :
+Diff_PPI_over_baseline<-c()
+dynamic_and_static_PPI<-c()
+  for (i in 4:ncol(cbound_data)) {
+  #Calculate fold change in PPI score in respect to Baseline condition and make a dataframe while maintaining the condition information:
+  temp_diff<-cbind(cbound_data[,1:2], "foldchange"= cbound_data$Baseline/cbound_data[,i], "condition" = colnames(cbound_data)[i] )
+  #Merge fold change data across conditions:
+  Diff_PPI_over_baseline<-rbind(Diff_PPI_over_baseline, temp_diff)
+  #Extract differential PPIs with more than 2 fold change:
+   temp_diff_2fold<-subset(temp_diff, (abs(log2(foldchange)) > 1))
+   #Extract nondifferential PPIs with less than 2 fold change:
+   temp_nondiff_2fold<-subset(temp_diff, (abs(log2(foldchange)) < 1))                       
+  temp_diff_2fold$condition=paste0("dynamic in ", colnames(cbound_data)[i])
+
+  temp_nondiff_2fold$condition=paste0("static in ",colnames(cbound_data)[i])
+  
+  #Annotate dynamic and static PPI based on above criteria:
+  dynamic_and_static_PPI<-rbind(dynamic_and_static_PPI, temp_diff_2fold, temp_nondiff_2fold)
+  } 
+
+#Visualize distribution of differential PPI scores as a fold change compared to Baseline for each condition:
+par(mar = c(15, 5, 2, 5), oma=c(0,0,0,0))
+plot(type = "n", x = 1)
+pirateplot(formula = log2(foldchange) ~  condition, 
+                   data = Diff_PPI_over_baseline,
+                   main = "Differential PPI score distribution",
+                   xlab = "",
+                   ylab = "Fold change over Baseline",
+                   sortx = "sequential", xaxt = "n")
+text(cex=0.8, x=1:6, y=-15, unique(Diff_PPI_over_baseline$condition), xpd=TRUE, srt=45)
+title(xlab="Condition", line=5, cex.lab=1.2)
+#Based on this plot it looks like each condition has roughly same number of gain and loss of interactions. 
+```
+
+
+```{r}
+#We will integrate Post-Translation Modification (PTM) data from Yeast Amino Acid Modification database, http://yaam.ifc.unam.mx/, version: 6/01/2019
+#Read Post-Translation Modification (PTM) data into R:
+acetylationPTM <- read.csv(paste0(getwd(),"/PTMs/AcetylPTM.csv"), header=T, stringsAsFactors = F)
+glycosylationPTM <- read.csv(paste0(getwd(),"/PTMs/GlycosylPTM.csv"), header=T, stringsAsFactors = F)
+phosphorylationPTM <- read.csv(paste0(getwd(),"/PTMs/PhosphorPTM.csv"), header=T, stringsAsFactors = F) 
+sumolyationPTM <- read.csv(paste0(getwd(),"/PTMs/SumoPTM.csv"), header=T, stringsAsFactors = F)
+ubiquitinilationPTM <- read.csv(paste0(getwd(),"/PTMs/UbiquitinPTM.csv"), header=T, stringsAsFactors = F)
+
+#Count the sum of number of sites for each PTM in each of the proteins for all PPI pairs and summarize in a data frame (PTMs DATA ARE LARGE,SO THIS MAY TAKE FEW MINUTES) :
+Acet_PTM <- c()
+Glyco_PTM <- c()
+Phospho_PTM <- c()
+Sumo_PTM <- c()
+Ubi_PTM <- c()
+
+for (i in 1:nrow(Diff_PPI_over_baseline)) {
+  Acet_count<-length(grep(as.character(Diff_PPI_over_baseline$AD[i]), acetylationPTM$SystematicName)) + length(grep(as.character(Diff_PPI_over_baseline$DB[i]), acetylationPTM$SystematicName))
+  
+  Glyco_count<-length(grep(as.character(Diff_PPI_over_baseline$AD[i]), glycosylationPTM$SystematicName)) + length(grep(as.character(Diff_PPI_over_baseline$DB[i]), glycosylationPTM$SystematicName))
+  
+  Phospho_count<-length(grep(as.character(Diff_PPI_over_baseline$AD[i]), phosphorylationPTM$SystematicName)) + length(grep(as.character(Diff_PPI_over_baseline$DB[i]), phosphorylationPTM$SystematicName))
+  
+  Sumo_count<-length(grep(as.character(Diff_PPI_over_baseline$AD[i]), sumolyationPTM$SystematicName)) + length(grep(as.character(Diff_PPI_over_baseline$DB[i]), sumolyationPTM$SystematicName))
+  
+  Ubi_count<-length(grep(as.character(Diff_PPI_over_baseline$AD[i]), ubiquitinilationPTM$SystematicName)) + length(grep(as.character(Diff_PPI_over_baseline$DB[i]), ubiquitinilationPTM$SystematicName))
+  
+  Acet_PTM<-c(Acet_PTM, Acet_count)
+  Glyco_PTM<-c(Glyco_PTM, Glyco_count)
+  Phospho_PTM<-c(Phospho_PTM, Phospho_count)
+  Sumo_PTM<-c(Sumo_PTM, Sumo_count)
+  Ubi_PTM<-c(Ubi_PTM, Ubi_count)
+}
+
+#Combine PTM information with the differential interaction information in a data frame: 
+Diff_PPI_PTMs<-cbind(Diff_PPI_over_baseline,"acet_sites"=Acet_PTM, "glyco_sites"=Glyco_PTM, "phospho_sites"=Phospho_PTM, "sumo_sites"=Sumo_PTM, "Ubi_sites"=Ubi_PTM)
+
+#For a start, we will visualize just phosphosite enrichment by separating PPIs accross conditions into dynamic (more than 2 fold change compared to baseline) and static (less than 2 fold change compared to baseline) categories:
+dyn_and_stat_phosphoPTM<-cbind(dynamic_and_static_PPI, "phosphoPTM"=Phospho_PTM)
+
+Phospho_PTM <- c() 
+for (i in 1:nrow(dynamic_and_static_PPI)) {
+  Phospho_count<-length(grep(as.character(dynamic_and_static_PPI$AD[i]), phosphorylationPTM$SystematicName)) + length(grep(as.character(dynamic_and_static_PPI$DB[i]), phosphorylationPTM$SystematicName))
+  Phospho_PTM<-c(Phospho_PTM, Phospho_count)
+}
+dyn_and_stat_phosphoPTM<-cbind(dynamic_and_static_PPI, "phosphoPTM"=Phospho_PTM)
+
+par(mar = c(15, 5, 2, 5), oma=c(0,0,0,0))
+plot(type = "n", x = 1)
+pirateplot(formula = log2(Phospho_PTM+0.01) ~ condition, 
+                   data = dyn_and_stat_phosphoPTM,
+                   main = "PTM sites in dynamic and static PPIs",
+                   xlab = "",
+                   ylab = "Phosphosites(Log2)",
+                   sortx = "sequential", xaxt = "n")
+text(cex=0.8, x=0:11, y=-15, unique(dyn_and_stat_phosphoPTM$condition), xpd=TRUE, srt=45)
+```
+
+```{r}
+#Now we will visualize the relationship between fold change of interaction scores and the total number of PTM sites in a given protein pair. As an example we will arbitrarily pick MMS and H2O2 conditions:
+layout(mat = matrix(c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ), 
+                        nrow = 2, 
+                        ncol = 5),
+       heights = c(1, 1),    # Heights of the two rows
+       widths = c(1, 1, 1, 1, 1))     # Widths of the two columns
+
+# Plot 1: Scatterplot
+par(mar = c(5, 4, 0, 0), oma=c(1,1,1,1))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS", ]$foldchange,2), 
+     y = Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS",]$acet_sites,
+     xlab = "Log fold change \nin MMS", 
+     ylab = "Number of acetylation sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS", ]$foldchange,2), 
+     y = Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS",]$glyco_sites,
+     xlab = "Log fold change \nin MMS", 
+     ylab = "Number of glycosilation sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS", ]$foldchange,2), 
+     y = Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS",]$phospho_sites,
+     xlab = "Log fold change \nin MMS", 
+     ylab = "Number of phosphorylation sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS", ]$foldchange,2), 
+     y = Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS",]$sumo_sites,
+     xlab = "Log fold change \nin MMS", 
+     ylab = "Number of sumoylation sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS", ]$foldchange,2), 
+     y = Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS",]$Ubi_sites,
+     xlab = "Log fold change \nin MMS", 
+     ylab = "Number of ubiquitination sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2", ]$foldchange,2), 
+     y = Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2",]$acet_sites,
+     xlab = "Log fold change \nin H2O2", 
+     ylab = "Number of acetylationion sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2", ]$foldchange,2), 
+     y = Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2",]$glyco_sites,
+     xlab = "Log fold change \nin H2O2", 
+     ylab = "Number of glycosylation sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2", ]$foldchange,2), 
+     y = Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2",]$phospho_sites,
+     xlab = "Log fold change \nin H2O2", 
+     ylab = "Number of phosphorylation sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2", ]$foldchange,2), 
+     y = Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2",]$sumo_sites,
+     xlab = "Log fold change \nin H2O2", 
+     ylab = "Number of sumoylation sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2", ]$foldchange,2), 
+     y = Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2",]$Ubi_sites,
+     xlab = "Log fold change \nin H2O2", 
+     ylab = "Number of ubiquitination sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+```
+
+
+```{r}
+#Based on the above visualization there is no clear relationship between number of PTM sites and log fold change of PPI scores across conditions.
+
+#Therefore we will plot the same relationship by distinguishing gain and loss of interactions. And for visualization purposes we will change the log base to 1.2: 
+
+layout(mat = matrix(c(1, 2, 3, 4, 5, 6, 7, 8 ), 
+                        nrow = 2, 
+                        ncol = 4),
+       heights = c(2, 2),    # Heights of the two rows
+       widths = c(2, 2, 2, 2))     # Widths of the two columns
+
+par(mar = c(5, 4, 0, 0))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS" & log(Diff_PPI_PTMs$foldchange)>0, ]$foldchange,1.2), 
+     y = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS" & log(Diff_PPI_PTMs$foldchange)>0,]$phospho_sites,1.2),
+     xlab = "Fold gain in MMS", 
+     ylab = "Number of phosphorylation sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS" & log(Diff_PPI_PTMs$foldchange)<0, ]$foldchange,1.2), 
+     y = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS" & log(Diff_PPI_PTMs$foldchange)<0,]$phospho_sites,1.2),
+     xlab = "Fold loss in MMS", 
+     ylab = "Number of phosphorylation sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS"& log(Diff_PPI_PTMs$foldchange)>0, ]$foldchange,1.2), 
+     y = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS" & log(Diff_PPI_PTMs$foldchange)>0,]$Ubi_sites,1.2),
+     xlab = "Fold gain in MMS", 
+     ylab = "Number of ubiquitinilation sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS"& log(Diff_PPI_PTMs$foldchange)<0, ]$foldchange,1.2), 
+     y = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="MMS" & log(Diff_PPI_PTMs$foldchange)<0,]$Ubi_sites,1.2),
+     xlab = "Fold loss in MMS", 
+     ylab = "Number of ubiquitinilation sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2" & log(Diff_PPI_PTMs$foldchange)>0, ]$foldchange,1.2), 
+     y = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2" & log(Diff_PPI_PTMs$foldchange)>0,]$phospho_sites),
+     xlab = "Fold gain in H2O2", 
+     ylab = "Number of phosphorylation sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2" & log(Diff_PPI_PTMs$foldchange)<0, ]$foldchange,1.2), 
+     y = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2" & log(Diff_PPI_PTMs$foldchange)<0,]$phospho_sites,1.2),
+     xlab = "Fold loss in H2O2", 
+     ylab = "Number of phosphorylation sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2"& log(Diff_PPI_PTMs$foldchange)>0, ]$foldchange,1.2), 
+     y = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2" & log(Diff_PPI_PTMs$foldchange)>0,]$Ubi_sites),
+     xlab = "Fold gain in H2O2", 
+     ylab = "Number of ubiquitinilation sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+plot(x = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2"& log(Diff_PPI_PTMs$foldchange)<0, ]$foldchange,1.2), 
+     y = log(Diff_PPI_PTMs[Diff_PPI_PTMs$condition=="H2O2" & log(Diff_PPI_PTMs$foldchange)<0,]$Ubi_sites,1.2),
+     xlab = "Fold loss in H2O2", 
+     ylab = "Number of ubiquitinilation sites", 
+     pch = 16, 
+     col = gray(.0, 0.2))
+#Here we can see a very weak enrichment for number of phosphorylation sites in gain of interaction pairs for MMS and H2O conditions. We can also observe a weak enrichment for ubiquitination and phosphorylation sites in loss of interaction pairs for MMS and H2O2 conditions, respectively. 
+```
+PART 7. HERE WE WILL EXPLORE THE RELATIONSHIPS BETWEEN DEGREE CHANGES AND GENE ESSENTIALITY, AS WELL AS BETWEEN DEGREE CHANGES AND PTMS.
+```{r}
+#Add gene essentiality phenotypes to degree change data frame:
+  Phenotype_for_deg=c()
+for(i in (1:nrow(cbound_deg_diff))){
+    if(cbound_deg_diff$gene[i] %in% essential_genes) {
+        temp_pheno_for_deg<-"Essential"
+    } else temp_pheno_for_deg<-"Non-essential"
+    Phenotype_for_deg=c(Phenotype_for_deg, temp_pheno_for_deg)  
+}
+
+cbound_deg_with_pheno <- cbind(cbound_deg_diff, "phenotype" = Phenotype_for_deg)
+
+#Count the sum of number of sites for each PTM in each of the proteins for all PPI pairs and summarize in a data frame:
+Acet_PTM_for_deg <- c()
+Glyco_PTM_for_deg <- c()
+Phospho_PTM_for_deg <- c()
+Sumo_PTM_for_deg <- c()
+Ubi_PTM_for_deg <- c()
+
+for (i in 1:nrow(cbound_deg_with_pheno)) {
+  Acet_count_for_deg<-length(grep(as.character(cbound_deg_with_pheno$gene[i]), acetylationPTM$SystematicName))
+  
+  Glyco_count_for_deg<-length(grep(as.character(cbound_deg_with_pheno$gene[i]), glycosylationPTM$SystematicName))
+  
+  Phospho_count_for_deg<-length(grep(as.character(cbound_deg_with_pheno$gene[i]), phosphorylationPTM$SystematicName))
+  
+  Sumo_count_for_deg<-length(grep(as.character(cbound_deg_with_pheno$gene[i]), sumolyationPTM$SystematicName))
+  
+  Ubi_count_for_deg<-length(grep(as.character(cbound_deg_with_pheno$gene[i]), ubiquitinilationPTM$SystematicName))
+  
+  Acet_PTM_for_deg<-c(Acet_PTM_for_deg, Acet_count_for_deg)
+  Glyco_PTM_for_deg<-c(Glyco_PTM_for_deg, Glyco_count_for_deg)
+  Phospho_PTM_for_deg<-c(Phospho_PTM_for_deg, Phospho_count_for_deg)
+  Sumo_PTM_for_deg<-c(Sumo_PTM_for_deg, Sumo_count_for_deg)
+  Ubi_PTM_for_deg<-c(Ubi_PTM_for_deg, Ubi_count_for_deg)
+}
+
+#Combine PTM information with the differential degree information in a data frame: 
+Diff_deg_with_pheno_PTMs<-cbind(cbound_deg_with_pheno,"acet_sites"=Acet_PTM, "glyco_sites"=Glyco_PTM, "phospho_sites"=Phospho_PTM, "sumo_sites"=Sumo_PTM, "Ubi_sites"=Ubi_PTM)
+
+#Correlation matrix between degree changes over baseline and PTM sites:
+cormat_deg <- round(cor(Diff_deg_with_pheno_PTMs[,c(2:7,9:13)]),2)
+ get_upper_tri_deg <- function(cormat_deg){
+    cormat_deg[lower.tri(cormat_deg)]<- NA
+    return(cormat_deg)
+  }
+upper_tri_deg <- get_upper_tri_deg(cormat_deg)
+melted_cormat_deg <- reshape2::melt(upper_tri_deg, na.rm = TRUE)
+
+ggplot(data = melted_cormat_deg, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Pearson\nCorrelation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+
+#Correlation matrix between degree changes of essential genes over baseline and PTM sites:
+essen_Diff_deg_with_pheno_PTMs<-Diff_deg_with_pheno_PTMs[Diff_deg_with_pheno_PTMs$phenotype=="Essential"]
+cormat_deg <- round(cor(essen_Diff_deg_with_pheno_PTMs[,c(2:7,9:13)]),2)
+ get_upper_tri_deg <- function(cormat_deg){
+    cormat_deg[lower.tri(cormat_deg)]<- NA
+    return(cormat_deg)
+  }
+upper_tri_deg <- get_upper_tri_deg(cormat_deg)
+melted_cormat_deg <- reshape2::melt(upper_tri_deg, na.rm = TRUE)
+
+ggplot(data = melted_cormat_deg, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Pearson\nCorrelation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+
+#Correlation matrix between degree changes of non-essential genes over baseline and PTM sites:
+nonessen_Diff_deg_with_pheno_PTMs<-Diff_deg_with_pheno_PTMs[Diff_deg_with_pheno_PTMs$phenotype=="Non-essential"]
+cormat_deg <- round(cor(nonessen_Diff_deg_with_pheno_PTMs[,c(2:7,9:13)]),2)
+
+ get_upper_tri_deg <- function(cormat_deg){
+    cormat_deg[lower.tri(cormat_deg)]<- NA
+    return(cormat_deg)
+  }
+upper_tri_deg <- get_upper_tri_deg(cormat_deg)
+melted_cormat_deg <- reshape2::melt(upper_tri_deg, na.rm = TRUE)
+
+ggplot(data = melted_cormat_deg, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, limit = c(-1,1), space = "Lab", 
+   name="Pearson\nCorrelation") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+#Comparing all three plots we can see that correlations for degree changes both amongst different conditions and condition and PTMs are stronger when the dataset is limited to essential genes. 
+```
+
+
+
+
